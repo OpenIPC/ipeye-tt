@@ -11,10 +11,14 @@ IMAGE=${IPEYE_TT_IMAGE:-golang:1.24}
 MODCACHE=${IPEYE_TT_MODCACHE:-ipeye-tt-gomod}
 mkdir -p bin out certs
 
+# -buildvcs=false because the checkout is bind-mounted into a container running
+# as root while the working copy belongs to whoever cloned it. Git then refuses
+# the repository as dubious ownership, and the stamping step fails the build
+# with "error obtaining VCS status" — for everyone whose host user is not root.
 build() {
   docker run --rm -v "$PWD":/src -w /src -v "$MODCACHE":/go/pkg/mod \
     -e GOFLAGS=-mod=mod -e CGO_ENABLED=0 "$IMAGE" \
-    sh -c 'go mod tidy >/dev/null && go build -trimpath -o bin/ipeye-tt ./cmd/ipeye-tt'
+    sh -c 'go mod tidy >/dev/null && go build -trimpath -buildvcs=false -o bin/ipeye-tt ./cmd/ipeye-tt'
 }
 
 case "$1" in

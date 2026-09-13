@@ -1,4 +1,6 @@
 bin/
 out/
-certs/
+# Anchored. Unanchored, this also matched internal/certs/ — which is source,
+# and which went missing from the repository because of it.
+/certs/
 *.log
