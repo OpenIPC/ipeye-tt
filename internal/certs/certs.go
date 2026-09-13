@@ -23,6 +23,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -31,6 +32,7 @@ const (
 	caKeyFile     = "ca.key"
 	serverCrtFile = "server.crt"
 	serverKeyFile = "server.key"
+	lockFile      = ".lock"
 
 	// Long enough that a bench camera's trust bundle does not quietly expire
 	// mid-project, and backdated an hour because a camera whose clock NTP has
@@ -50,6 +52,19 @@ func Ensure(dir, name string) (tls.Certificate, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return tls.Certificate{}, err
 	}
+
+	/* One writer at a time. Two instances started together — different ports,
+	   same default -cert-dir — would otherwise each mint a root, and the one
+	   that lost the race would serve a leaf chaining to a CA that is no longer
+	   the ca.crt on disk. Cameras trust the file, so that instance becomes
+	   unreachable and the run reports "the camera never connected": a FAIL
+	   that is not the camera's fault, which is the one thing this tool must
+	   not produce. */
+	unlock, err := lock(dir)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	defer unlock()
 
 	caCert, caKey, err := ensureCA(dir)
 	if err != nil {
@@ -106,7 +121,7 @@ func reusable(dir, name string, ca *x509.Certificate) (tls.Certificate, bool) {
 	if leaf.VerifyHostname(name) != nil {
 		return tls.Certificate{}, false
 	}
-	if time.Now().After(leaf.NotAfter) {
+	if !within(leaf) {
 		return tls.Certificate{}, false
 	}
 	if leaf.CheckSignatureFrom(ca) != nil {
@@ -172,10 +187,55 @@ func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if time.Now().After(cert.NotAfter) {
-		return nil, nil, errors.New("certificates: the CA on disk has expired")
+
+	/* Parsing is not usability. Anything wrong here produces a chain that
+	   clients trusting ca.crt reject, and a rejected handshake reads as a
+	   camera fault — so each of these is a reason to mint a fresh authority
+	   rather than to carry on with a broken one. */
+	if !within(cert) {
+		return nil, nil, errors.New("certificates: the CA on disk is not currently valid")
+	}
+	if !cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, nil, errors.New("certificates: the certificate on disk cannot sign")
+	}
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || !pub.Equal(&key.PublicKey) {
+		return nil, nil, errors.New("certificates: the CA key does not match its certificate")
 	}
 	return cert, key, nil
+}
+
+/*
+Valid now, at both ends. The upper bound is the obvious one; the lower
+
+	matters because certificates are issued relative to this host's clock, and a
+	clock that was ahead when one was written and has since been corrected
+	leaves it not valid *yet* — which fails handshakes just as completely.
+*/
+func within(cert *x509.Certificate) bool {
+	now := time.Now()
+	return !now.Before(cert.NotBefore) && !now.After(cert.NotAfter)
+}
+
+/*
+An exclusive lock on the certificate directory, released by the returned
+
+	function. flock, so it is held by the open file description and released
+	even if the process dies.
+*/
+func lock(dir string) (func(), error) {
+	f, err := os.OpenFile(file(dir, lockFile), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 func template(subject pkix.Name) (*x509.Certificate, error) {
@@ -193,7 +253,7 @@ func template(subject pkix.Name) (*x509.Certificate, error) {
 }
 
 func write(dir, crtName, keyName string, der []byte, key *ecdsa.PrivateKey) error {
-	if err := os.WriteFile(file(dir, crtName),
+	if err := replace(file(dir, crtName),
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
 		return err
 	}
@@ -201,8 +261,38 @@ func write(dir, crtName, keyName string, der []byte, key *ecdsa.PrivateKey) erro
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file(dir, keyName),
+	return replace(file(dir, keyName),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600)
+}
+
+/*
+Write through a temporary file and rename over the target.
+
+	Not for atomicity alone: os.WriteFile's mode applies only when it creates
+	the file, so rewriting a key that already existed with permissive bits left
+	the private material readable by every local user while reporting success.
+	A fresh inode carries the mode asked for, whatever was there before.
+*/
+func replace(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func file(dir, name string) string { return filepath.Join(dir, name) }
